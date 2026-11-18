@@ -44,6 +44,7 @@ mod globbing;
 pub mod grammar;
 mod history;
 pub mod hostnames;
+mod image_preview;
 mod iter_first_last;
 mod kill_on_drop_child;
 mod logging;

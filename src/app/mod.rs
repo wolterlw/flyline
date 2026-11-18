@@ -376,6 +376,8 @@ pub(crate) struct App<'a> {
     pub(super) content_mode: ContentMode,
     pub(super) last_contents: Option<DrawnContent>,
     pub(super) tooltip: Option<String>,
+    pub(super) image_preview: crate::image_preview::ImagePreviewManager,
+    pub(super) image_preview_supported: bool,
     /// Terminal row (absolute) where the inline viewport starts; used by smart mouse mode.
     /// Timestamp of the last draw operation.
     pub(super) last_draw_time: std::time::Instant,
@@ -534,6 +536,8 @@ impl<'a> App<'a> {
             content_mode: ContentMode::Normal,
             last_contents: None,
             tooltip: None,
+            image_preview: Default::default(),
+            image_preview_supported: crate::image_preview::terminal_supported(),
             last_draw_time: std::time::Instant::now(),
             needs_screen_cleared: false,
             needs_full_redraw: false,
@@ -832,6 +836,9 @@ impl<'a> App<'a> {
                 redraw = true;
             }
             if self.poll_flycomp() {
+                redraw = true;
+            }
+            if self.image_preview.poll() {
                 redraw = true;
             }
             if self.poll_path_warming() {

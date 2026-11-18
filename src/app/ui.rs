@@ -113,7 +113,96 @@ impl DrawnContent {
     }
 }
 
+/// Where to draw the image preview for the selected completion.
+pub(super) struct CompletionPreviewTarget {
+    path: std::path::PathBuf,
+    top: u16,
+    /// Column the preview is anchored to: its left edge, or its right edge
+    /// (exclusive) when `left_of_anchor` is set.
+    anchor_col: u16,
+    left_of_anchor: bool,
+    max_cols: u16,
+    max_rows: u16,
+}
+
+const MIN_PREVIEW_COLS: u16 = 12;
+const PREVIEW_ROWS: u16 = crate::image_preview::MAX_ROWS;
+
 impl App<'_> {
+    fn completion_preview_max_cols(width: u16) -> u16 {
+        (width / 3).min(crate::image_preview::MAX_COLS)
+    }
+
+    /// Columns to reserve on the right of the tab-completion grid for an image
+    /// preview. Reserved whenever any filtered suggestion looks like an image,
+    /// so the grid doesn't jump around as the selection moves.
+    fn completion_preview_reserve(
+        supported: bool,
+        active_suggestions: &ActiveSuggestions,
+        width: u16,
+    ) -> u16 {
+        let cols = Self::completion_preview_max_cols(width);
+        if !supported || cols < MIN_PREVIEW_COLS {
+            return 0;
+        }
+        let has_images = active_suggestions.filtered_suggestions.iter().any(|f| {
+            active_suggestions
+                .processed_suggestions
+                .get(f.suggestion_idx)
+                .and_then(|sug| sug.path.as_ref())
+                .is_some_and(|p| crate::image_preview::has_image_extension(&p.to_string_lossy()))
+        });
+        if has_images { cols + 1 } else { 0 }
+    }
+
+    fn selected_completion_image(
+        active_suggestions: &ActiveSuggestions,
+    ) -> Option<std::path::PathBuf> {
+        let idx = active_suggestions.current_1d_index()?;
+        let filtered = active_suggestions.filtered_suggestions.get(idx)?;
+        let sug = active_suggestions
+            .processed_suggestions
+            .get(filtered.suggestion_idx)?;
+        crate::image_preview::existing_image(sug.path.as_ref()?)
+    }
+
+    /// Decide where the preview goes, given the area the suggestions were drawn in.
+    /// For the grid, the preview sits in the reserved space on the right; for the
+    /// popup, to its right if there's room, otherwise to its left.
+    fn completion_preview_target(
+        supported: bool,
+        active_suggestions: &ActiveSuggestions,
+        area: Option<Rect>,
+        is_grid: bool,
+        width: u16,
+    ) -> Option<CompletionPreviewTarget> {
+        if !supported {
+            return None;
+        }
+        let area = area?;
+        let path = Self::selected_completion_image(active_suggestions)?;
+        let max_cols = Self::completion_preview_max_cols(width);
+        if max_cols < MIN_PREVIEW_COLS {
+            return None;
+        }
+        let fits_right = width.saturating_sub(area.right() + 1) >= max_cols;
+        let (anchor_col, left_of_anchor) = if is_grid || fits_right {
+            (area.right() + 1, false)
+        } else if area.x > max_cols {
+            (area.x - 1, true)
+        } else {
+            return None;
+        };
+        Some(CompletionPreviewTarget {
+            path,
+            top: area.y,
+            anchor_col,
+            left_of_anchor,
+            max_cols,
+            max_rows: PREVIEW_ROWS,
+        })
+    }
+
     #[expect(clippy::too_many_arguments)]
     fn render_history_entry(
         content: &mut Contents,
@@ -923,19 +1012,36 @@ impl App<'_> {
             crate::settings().colour_palette.scrollbar()
         };
 
+        let image_preview_supported = self.image_preview_supported;
+        let mut completion_preview: Option<CompletionPreviewTarget> = None;
+
         match &mut self.content_mode {
             ContentMode::TabCompletion(active_suggestions) if self.mode.is_running() => {
                 if !active_suggestions.auto_started {
-                    Self::render_user_suggestions(
+                    let reserve = Self::completion_preview_reserve(
+                        image_preview_supported,
+                        active_suggestions,
+                        width,
+                    );
+                    let rect = Self::render_user_suggestions(
                         crate::settings(),
                         active_suggestions,
                         &mut content,
-                        width,
+                        width - reserve,
                         rows_left_before_end_of_screen,
                         cursor_pos_maybe,
                     );
+                    if reserve > 0 {
+                        completion_preview = Self::completion_preview_target(
+                            image_preview_supported,
+                            active_suggestions,
+                            rect,
+                            true,
+                            width,
+                        );
+                    }
                 } else if crate::settings().auto_suggest {
-                    Self::render_auto_suggestions(
+                    let rect = Self::render_auto_suggestions(
                         crate::settings(),
                         active_suggestions,
                         &mut content,
@@ -946,6 +1052,13 @@ impl App<'_> {
                         self.buffer.cursor_byte_pos(),
                         scrollbar_style,
                         terminal_height,
+                    );
+                    completion_preview = Self::completion_preview_target(
+                        image_preview_supported,
+                        active_suggestions,
+                        rect,
+                        false,
+                        width,
                     );
                 }
             }
@@ -976,16 +1089,30 @@ impl App<'_> {
                     }
                 } else if let Some(active_suggestions) = last_active_suggestions {
                     if !*auto_started {
-                        Self::render_user_suggestions(
+                        let reserve = Self::completion_preview_reserve(
+                            image_preview_supported,
+                            active_suggestions,
+                            width,
+                        );
+                        let rect = Self::render_user_suggestions(
                             crate::settings(),
                             active_suggestions,
                             &mut content,
-                            width,
+                            width - reserve,
                             rows_left_before_end_of_screen,
                             cursor_pos_maybe,
                         );
+                        if reserve > 0 {
+                            completion_preview = Self::completion_preview_target(
+                                image_preview_supported,
+                                active_suggestions,
+                                rect,
+                                true,
+                                width,
+                            );
+                        }
                     } else if crate::settings().auto_suggest {
-                        Self::render_auto_suggestions(
+                        let rect = Self::render_auto_suggestions(
                             crate::settings(),
                             active_suggestions,
                             &mut content,
@@ -996,6 +1123,13 @@ impl App<'_> {
                             self.buffer.cursor_byte_pos(),
                             scrollbar_style,
                             terminal_height,
+                        );
+                        completion_preview = Self::completion_preview_target(
+                            image_preview_supported,
+                            active_suggestions,
+                            rect,
+                            false,
+                            width,
                         );
                     }
                 }
@@ -1490,6 +1624,25 @@ impl App<'_> {
             _ => {}
         }
 
+        // Side preview of the selected completion, if it is an image.
+        match completion_preview {
+            Some(target) => {
+                self.image_preview
+                    .set_target(Some(target.path), target.max_cols, target.max_rows);
+                if let Some((cols, _)) = self.image_preview.ready_size() {
+                    let left = if target.left_of_anchor {
+                        target.anchor_col.saturating_sub(cols)
+                    } else {
+                        target.anchor_col
+                    };
+                    self.image_preview.render_at(&mut content, target.top, left);
+                }
+            }
+            None => {
+                self.image_preview.set_target(None, 0, 0);
+            }
+        }
+
         let show_matrix = self.mode.is_running()
             && match &crate::settings().matrix_animation {
                 MatrixAnimation::Off => false,
@@ -1717,8 +1870,9 @@ impl App<'_> {
         width: u16,
         rows_left_before_end_of_screen: u16,
         _cursor_pos_maybe: Option<Coord>,
-    ) {
+    ) -> Option<Rect> {
         content.newline();
+        let mut grid_area = None;
 
         if active_suggestions.all_suggestions_len() > 0 {
             let grid_start_row = content.cursor_position().row;
@@ -1764,6 +1918,7 @@ impl App<'_> {
             if let Some(sel_row) = selected_grid_row {
                 content.set_focus_row(grid_start_row + sel_row);
             }
+            grid_area = Some(Rect::new(0, grid_start_row, width, num_rows as u16));
         }
 
         let pos_string = active_suggestions
@@ -1795,6 +1950,7 @@ impl App<'_> {
             ),
             Tag::TabSuggestion,
         ));
+        grid_area
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1809,12 +1965,12 @@ impl App<'_> {
         cursor_byte_pos: usize,
         scrollbar_style: Style,
         terminal_height: u16,
-    ) {
+    ) -> Option<Rect> {
         let original_buf_len = content.buf.len();
         content.newline();
 
         if active_suggestions.all_suggestions_len() == 0 {
-            return;
+            return None;
         }
 
         let grid_start_row = content.cursor_position().row;
@@ -1844,7 +2000,7 @@ impl App<'_> {
         let items = active_suggestions.into_list(num_rows_visible, &settings.colour_palette);
         let num_rows_visible = items.len();
         if num_rows_visible == 0 {
-            return;
+            return None;
         }
 
         let term_width = width as usize;
@@ -1854,7 +2010,7 @@ impl App<'_> {
         // underflow the box-width math below (which panics under the release
         // profile's `overflow-checks`). Nothing useful can be drawn, so bail.
         if term_width == 0 {
-            return;
+            return None;
         }
 
         let suggestion_prefix_width = active_suggestions
@@ -2191,6 +2347,7 @@ impl App<'_> {
                 Tag::Normal,
             );
         }
+        Some(box_area)
     }
 
     #[expect(clippy::too_many_arguments)]

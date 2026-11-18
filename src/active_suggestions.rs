@@ -173,6 +173,10 @@ pub struct ProcessedSuggestion {
     pub description: SuggestionDescription,
     /// The type of suggestion (Folder, RegularFile, or Misc).
     pub sug_type: SuggestionType,
+    /// Absolute filesystem path this suggestion refers to, for file completions.
+    /// Kept in serialization: completions are produced in a forked subshell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1358,6 +1362,7 @@ impl ProcessedSuggestion {
             style: None,
             description: SuggestionDescription::Static(vec![]),
             sug_type: SuggestionType::Misc,
+            path: None,
         }
     }
 
@@ -1661,9 +1666,10 @@ impl UnprocessedSuggestion {
         if had_closing_quote && let Some(qc) = quote_char {
             suffix_str = format!("{}{}", qc, suffix_str);
         }
-        let suggestion = ProcessedSuggestion::new(display_s, prefix, &suffix_str)
+        let mut suggestion = ProcessedSuggestion::new(display_s, prefix, &suffix_str)
             .with_description(description)
             .with_type(suggestion_type);
+        suggestion.path = path_to_use;
         match style {
             Some(s) => suggestion.with_style(s),
             None => suggestion,
@@ -2637,6 +2643,7 @@ mod subshell_payload_serde_tests {
             style: Some(style),
             description: desc,
             sug_type: SuggestionType::Misc,
+            path: None,
         });
         builder.unprocessed.push_back(UnprocessedSuggestion {
             raw_text: "test\tdesc".to_string(),
