@@ -37,23 +37,47 @@ const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 
 /// Whether the terminal (possibly behind tmux) is one known to support kitty
 /// graphics Unicode placeholders.
+///
+/// Over ssh none of the local signals survive, so the client side can export
+/// `LC_TERMINAL=ghostty|kitty` (LC_* is forwarded by default on Debian/Ubuntu).
 pub fn terminal_supported() -> bool {
-    if std::env::var_os("FLYLINE_IMAGE_PREVIEW").is_some_and(|v| v == "0") {
-        return false;
-    }
-    if std::env::var_os("FLYLINE_IMAGE_PREVIEW").is_some_and(|v| v == "1") {
-        return true;
+    match env("FLYLINE_IMAGE_PREVIEW").as_deref() {
+        Some("0") => return false,
+        Some("1") => return true,
+        _ => {}
     }
     if crate::term_info::is_ghostty() || crate::term_info::is_kitty() {
         return true;
     }
+    if matches!(env("LC_TERMINAL").as_deref(), Some("ghostty" | "kitty")) {
+        return true;
+    }
     // Behind tmux the terminal query is answered by tmux itself, so fall back
     // to the variables Ghostty/kitty export into the session environment.
-    let term = std::env::var("TERM").unwrap_or_default();
-    std::env::var_os("KITTY_WINDOW_ID").is_some()
-        || std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
+    let term = env("TERM").unwrap_or_default();
+    env("KITTY_WINDOW_ID").is_some()
+        || env("GHOSTTY_RESOURCES_DIR").is_some()
         || term == "xterm-kitty"
         || term == "xterm-ghostty"
+}
+
+/// Shell variable lookup: bash's exports aren't reflected in this process's
+/// environ, so ask the shell rather than std::env.
+fn env(name: &str) -> Option<String> {
+    crate::shell::backend()
+        .env_var(name)
+        .filter(|v| !v.is_empty())
+}
+
+/// How many tmux layers sit between this shell and the real terminal; each one
+/// needs its own passthrough wrapper. `LC_TERMINAL_MUX_DEPTH` (exported by the
+/// shell setup and forwarded over ssh) covers nested tmux across ssh; otherwise
+/// it's 1 inside tmux, 0 outside.
+fn tmux_depth() -> usize {
+    env("LC_TERMINAL_MUX_DEPTH")
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|d| d.min(4))
+        .unwrap_or_else(|| usize::from(in_tmux()))
 }
 
 /// Cheap check (no filesystem access) whether a word looks like an image path.
@@ -143,10 +167,10 @@ impl ImagePreviewManager {
         let id = alloc_id();
         let (cell_w, cell_h) = cell_pixel_size();
         let load_path = path.clone();
-        let multiplexed = in_tmux();
-        let Some(handle) = spawn_subshell(move || {
-            load_image(&load_path, id, cell_w, cell_h, max_box, multiplexed)
-        }) else {
+        let depth = tmux_depth();
+        let Some(handle) =
+            spawn_subshell(move || load_image(&load_path, id, cell_w, cell_h, max_box, depth))
+        else {
             return true;
         };
         self.current = Some(Preview {
@@ -250,7 +274,7 @@ impl ImagePreviewManager {
         {
             let cmd = format!("\x1b_Ga=d,d=I,i={},q=2\x1b\\", preview.id);
             let mut out = std::io::stdout();
-            let _ = out.write_all(&wrap_for_tmux(cmd.as_bytes(), in_tmux()));
+            let _ = out.write_all(&wrap_for_tmux(cmd.as_bytes(), tmux_depth()));
             let _ = out.flush();
         }
     }
@@ -282,7 +306,7 @@ fn load_image(
     cell_w: f32,
     cell_h: f32,
     (max_cols, max_rows): (u16, u16),
-    multiplexed: bool,
+    depth: usize,
 ) -> Option<Loaded> {
     let img = image::ImageReader::open(path)
         .ok()?
@@ -335,7 +359,7 @@ fn load_image(
         }
         seq.extend_from_slice(chunk);
         seq.extend_from_slice(b"\x1b\\");
-        escape.extend_from_slice(&wrap_for_tmux(&seq, multiplexed));
+        escape.extend_from_slice(&wrap_for_tmux(&seq, depth));
     }
     let escape = String::from_utf8(escape).ok()?;
     Some(Loaded { cols, rows, escape })
@@ -348,20 +372,23 @@ fn in_tmux() -> bool {
     )
 }
 
-fn wrap_for_tmux(seq: &[u8], multiplexed: bool) -> Vec<u8> {
-    if !multiplexed {
-        return seq.to_vec();
-    }
-    let mut out = Vec::with_capacity(seq.len() + 16);
-    out.extend_from_slice(b"\x1bPtmux;");
-    for &b in seq {
-        if b == 0x1b {
-            out.push(0x1b);
+/// Wrap `seq` in `depth` layers of tmux passthrough (`ESC P tmux; ... ESC \`,
+/// with every inner ESC doubled). Each tmux unwraps one layer.
+fn wrap_for_tmux(seq: &[u8], depth: usize) -> Vec<u8> {
+    let mut cur = seq.to_vec();
+    for _ in 0..depth {
+        let mut out = Vec::with_capacity(cur.len() * 2 + 16);
+        out.extend_from_slice(b"\x1bPtmux;");
+        for &b in &cur {
+            if b == 0x1b {
+                out.push(0x1b);
+            }
+            out.push(b);
         }
-        out.push(b);
+        out.extend_from_slice(b"\x1b\\");
+        cur = out;
     }
-    out.extend_from_slice(b"\x1b\\");
-    out
+    cur
 }
 
 #[cfg(test)]
@@ -373,6 +400,20 @@ mod tests {
     fn placeholder_is_single_width() {
         let s: String = [PLACEHOLDER, DIACRITICS[3], DIACRITICS[7]].iter().collect();
         assert_eq!(s.width(), 1);
+    }
+
+    #[test]
+    fn nested_tmux_wrapping() {
+        let seq = b"\x1b_Ga=d\x1b\\";
+        assert_eq!(wrap_for_tmux(seq, 0), seq.to_vec());
+        assert_eq!(
+            wrap_for_tmux(seq, 1),
+            b"\x1bPtmux;\x1b\x1b_Ga=d\x1b\x1b\\\x1b\\".to_vec()
+        );
+        // outer layer doubles the ESCs of the already-wrapped inner layer
+        let two = wrap_for_tmux(seq, 2);
+        assert!(two.starts_with(b"\x1bPtmux;\x1b\x1bPtmux;\x1b\x1b\x1b\x1b_G"));
+        assert!(two.ends_with(b"\x1b\x1b\\\x1b\\"));
     }
 
     #[test]
